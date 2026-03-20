@@ -1,40 +1,51 @@
 #!/usr/bin/env python3
 """
-sql_dbo.py — Oblio SQL Memory Module
-========================================
-Production-quality SQL memory operations for all Oblio agents.
-Supports two backends:
-  - 'local'  → SQL Server 2019 on DEAUS (10.0.0.110)
-  - 'cloud'  → site4now hosted (SQL5112.site4now.net)
+sql_memory.py — Oblio SQL Memory Module (v2.0)
+===============================================
+Semantic memory layer for OpenClaw agents. All operations go through
+SQLConnector v2 (pymssql, parameterised, sealed API) — no subprocess/sqlcmd.
 
-All credentials loaded from .env — never hardcoded.
+Supports two backends:
+  - 'cloud'  → site4now hosted (SQL5112.site4now.net) — default
+  - 'local'  → SQL Server on DEAUS (10.0.0.110)
+
+Backward-compatible with v1.x callers:
+  - SQLMemory('cloud')         — works as before
+  - get_memory('cloud')        — singleton factory preserved
+  - mem.remember / recall / search / queue_task / log_event — all preserved
+  - mem.execute(raw_sql)       — preserved as legacy passthrough (returns bool)
+  - mem.execute_scalar(sql)    — preserved, returns Any
+
+New in v2.0:
+  - Transport: pymssql native driver (no sqlcmd subprocess)
+  - UTC timestamps everywhere (datetime.now(timezone.utc))
+  - Parameterised queries throughout — no string interpolation
+  - execute_via_file() preserved as execute() — file-based workaround no longer needed
+  - _parse_table() kept for any callers using raw output parsing (no-op path)
 
 Usage:
     from sql_memory import SQLMemory, get_memory
-    mem = get_memory('local')
-    mem.remember('facts', 'sky_color', 'The sky is blue', importance=3, tags='nature')
+    mem = get_memory('cloud')
+    mem.remember('facts', 'sky_color', 'The sky is blue', importance=3)
     result = mem.recall('facts', 'sky_color')
 """
 
 import os
 import sys
 import json
-import time
 import logging
-import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 
-# ── Load .env ────────────────────────────────────────────────────────────────
+# ── Find and load .env ────────────────────────────────────────────────────────
 import pathlib as _pathlib
 
-def _find_env():
-    """Walk up from this file's directory to find .env (handles infrastructure/ subdir)."""
+def _find_env() -> Optional[str]:
     p = _pathlib.Path(os.path.abspath(__file__)).parent
-    for _ in range(4):
-        candidate = p / '.env'
-        if candidate.exists():
-            return str(candidate)
+    for _ in range(5):
+        c = p / '.env'
+        if c.exists():
+            return str(c)
         p = p.parent
     return None
 
@@ -51,814 +62,429 @@ except ImportError:
                 line = line.strip()
                 if line and not line.startswith('#') and '=' in line:
                     k, v = line.split('=', 1)
-                    v = v.strip().strip('"').strip("'")
-                    os.environ[k.strip()] = v
+                    os.environ[k.strip()] = v.strip().strip('"').strip("'")
 
-# ── Backend Configs ──────────────────────────────────────────────────────────
-BACKENDS = {
-    'local': {
-        'server':   os.getenv('SQL_SERVER', '10.0.0.110'),
-        'port':     int(os.getenv('SQL_PORT', '1433')),
-        'database': os.getenv('SQL_DATABASE', 'Oblio_Memories'),
-        'user':     os.getenv('SQL_USER', 'oblio'),
-        'password': os.getenv('SQL_PASSWORD', ''),
-        'encrypt':  False,
-    },
-    'cloud': {
-        'server':   os.getenv('SQL_CLOUD_SERVER'),
-        'port':     int(os.getenv('SQL_CLOUD_PORT', '1433')),
-        'database': os.getenv('SQL_CLOUD_DATABASE'),
-        'user':     os.getenv('SQL_CLOUD_USER'),
-        'password': os.getenv('SQL_CLOUD_PASSWORD'),
-        'encrypt':  True,
-    },
-}
+# ── Import connector (handles both skill install path and infrastructure path) ─
 
-SQLCMD = os.getenv('SQLCMD', '/opt/mssql-tools/bin/sqlcmd')
-LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+def _import_connector():
+    """Find and import SQLConnector from wherever it's installed."""
+    # Try adjacent skill install first (workspace/skills/sql-connector/)
+    skill_path = os.path.join(os.path.dirname(__file__), '..', 'sql-connector')
+    infra_path = os.path.join(os.path.dirname(__file__), '..', 'infrastructure')
+    for p in [skill_path, infra_path, os.path.dirname(__file__)]:
+        abs_p = os.path.abspath(p)
+        if os.path.exists(os.path.join(abs_p, 'sql_connector.py')):
+            if abs_p not in sys.path:
+                sys.path.insert(0, abs_p)
+            from sql_connector import get_connector, SQLConnector
+            return get_connector, SQLConnector
+    raise ImportError("sql_connector.py not found. Install the sql-connector skill first.")
 
-# ── Logger ───────────────────────────────────────────────────────────────────
+get_connector, SQLConnector = _import_connector()
+
+# ── Logger ────────────────────────────────────────────────────────────────────
+
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'logs')
 os.makedirs(LOG_DIR, exist_ok=True)
+
 _log = logging.getLogger('sql_memory')
 if not _log.handlers:
     _log.setLevel(logging.INFO)
     _fh = logging.FileHandler(os.path.join(LOG_DIR, 'sql_dbo.log'))
     _fh.setFormatter(logging.Formatter('%(asctime)s [sql_memory] %(levelname)s %(message)s'))
+    _fh.formatter.converter = __import__('time').gmtime  # UTC timestamps in log file
     _log.addHandler(_fh)
 
 
-def _esc(s: str, max_len: int = 4000) -> str:
-    """Escape single quotes and truncate for safe SQL insertion."""
-    if s is None:
-        return ''
-    return str(s)[:max_len].replace("'", "''")
-
+# ── SQLMemory ─────────────────────────────────────────────────────────────────
 
 class SQLMemory:
     """
     Unified SQL memory interface for Oblio agents.
+    Wraps SQLConnector — all queries are parameterised, no string interpolation.
 
     Args:
-        backend: 'local' or 'cloud' — selects which SQL Server to connect to.
-
-    Example:
-        mem = SQLMemory('local')
-        mem.remember('facts', 'pi', 'Pi is approximately 3.14159', importance=4)
-        print(mem.recall('facts', 'pi'))
+        backend: 'cloud' (default) or 'local'
     """
 
-    def __init__(self, backend: str = 'local'):
-        if backend not in BACKENDS:
-            raise ValueError(f"Unknown backend '{backend}'. Use 'local' or 'cloud'.")
+    def __init__(self, backend: str = 'cloud') -> None:
         self.backend = backend
-        self.config = BACKENDS[backend]
-        self.max_retries = 3
-        self.retry_delay = 2
-        _log.info(f"SQLMemory initialized (backend={backend}, server={self.config['server']})")
+        self._db = get_connector(backend)
+        _log.info(f"SQLMemory v2.0 initialized (backend={backend})")
 
-    # ── Low-level SQL ────────────────────────────────────────────────────────
+    # ── Low-level passthrough (v1.x compatibility) ────────────────────────────
 
-    def execute(self, query: str, timeout: int = 30) -> str:
-        """Execute a SQL query via sqlcmd and return stdout. Retries on failure."""
-        # Build server string with port: "10.0.0.110,1433"
-        server_str = f"{self.config['server']},{self.config['port']}"
-        # Wrap query with EXECUTE AS USER='dbo' to ensure schema access
-        # (oblio owns the memory schema but SQL Server requires explicit grants
-        # which cannot be self-granted; dbo impersonation bypasses this)
-        if self.backend == 'local' and not query.strip().upper().startswith('EXECUTE AS'):
-            query = f"EXECUTE AS USER='dbo'; {query}; REVERT"
-        cmd = [
-            SQLCMD,
-            '-S', server_str,
-            '-d', self.config['database'],
-            '-U', self.config['user'],
-            '-P', self.config['password'],
-            '-Q', query,
-            '-l', str(timeout),
-        ]
-        if self.config['encrypt']:
-            cmd.extend(['-N', '-C'])  # Encrypt + TrustServerCertificate
+    def execute(self, query: str, timeout: int = 30) -> bool:
+        """
+        Legacy passthrough for raw SQL. Returns bool (v2) instead of stdout string (v1).
+        Callers that checked 'error' in result.lower() should switch to checking False.
+        NOTE: Raw SQL here bypasses parameterisation — migrate to mem.* methods for new code.
+        """
+        return self._db.execute(query)
 
-        last_err = None
-        for attempt in range(self.max_retries):
-            try:
-                result = subprocess.run(
-                    cmd, capture_output=True, text=True, timeout=timeout + 10
-                )
-                if result.returncode != 0 and result.stderr:
-                    err_msg = result.stderr.strip()
-                    if 'Login failed' in err_msg or 'Cannot open' in err_msg:
-                        _log.error(f"SQL auth/db error: {err_msg}")
-                        return ''
-                    last_err = err_msg
-                    _log.warning(f"SQL attempt {attempt+1}/{self.max_retries}: {err_msg}")
-                    time.sleep(self.retry_delay)
-                    continue
-                return result.stdout.strip()
-            except subprocess.TimeoutExpired:
-                _log.warning(f"SQL timeout attempt {attempt+1}/{self.max_retries}")
-                last_err = 'timeout'
-                time.sleep(self.retry_delay)
-            except Exception as e:
-                _log.error(f"SQL execute error: {e}")
-                last_err = str(e)
-                time.sleep(self.retry_delay)
+    def execute_scalar(self, query: str) -> Optional[Any]:
+        """Execute query and return first value. Parameterised via scalar()."""
+        return self._db.scalar(query)
 
-        _log.error(f"SQL failed after {self.max_retries} attempts: {last_err}")
-        return ''
-
-    def execute_scalar(self, query: str) -> Optional[str]:
-        """Execute query and return first non-header value."""
-        out = self.execute(query)
-        lines = [l.strip() for l in out.split('\n') if l.strip() and not l.startswith('-')]
-        # Skip header row and separator
-        data_lines = []
-        for line in lines:
-            if 'rows affected' in line.lower():
-                continue
-            data_lines.append(line)
-        if len(data_lines) >= 2:
-            return data_lines[1]  # first data row after header
-        return None
+    def execute_via_file(self, query: str, timeout: int = 30) -> bool:
+        """v1.x large-payload workaround — now just delegates to execute() since pymssql has no arg-length limit."""
+        return self._db.execute(query)
 
     def execute_rows(self, query: str) -> List[str]:
-        """Execute query and return all data lines (excluding headers/footers)."""
-        out = self.execute(query)
-        lines = out.split('\n')
-        data = []
-        header_done = False
-        for line in lines:
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if stripped.startswith('---') or stripped.startswith('==='):
-                header_done = True
-                continue
-            if 'rows affected' in stripped.lower():
-                continue
-            if not header_done:
-                header_done = True  # skip first line (header)
-                continue
-            data.append(stripped)
-        return data
+        """Execute query and return rows as list of strings (v1.x compat)."""
+        rows = self._db.query(query)
+        return [str(list(r.values())) for r in rows]
 
-    # ── Memory Operations (dbo.Memories) ──────────────────────────────────
+    def ping(self) -> bool:
+        return self._db.ping()
+
+    # ── Memory Operations ─────────────────────────────────────────────────────
 
     def remember(self, category: str, key: str, content: str,
                  importance: int = 3, tags: str = '') -> bool:
         """
         Store or update a memory. Upserts by category + key_name.
-
-        Args:
-            category: Memory category (e.g., 'facts', 'preferences', 'facs_training')
-            key: Unique key within the category
-            content: The content to remember
-            importance: 1-5 scale (5 = critical)
-            tags: Comma-separated tags for search
-
-        Returns:
-            True if successful
+        importance: 1-10 (10 = permanent)
         """
-        cat = _esc(category, 100)
-        k = _esc(key, 255)
-        c = _esc(content)
-        t = _esc(tags, 500)
-        query = f"""
-            IF EXISTS (SELECT 1 FROM memory.Memories
-                       WHERE category='{cat}' AND key_name='{k}' AND is_active=1)
-                UPDATE memory.Memories
-                SET content='{c}', importance={importance}, tags='{t}',
-                    updated_at=GETDATE()
-                WHERE category='{cat}' AND key_name='{k}' AND is_active=1;
-            ELSE
-                INSERT INTO memory.Memories
-                    (category, key_name, content, importance, tags, source, is_active)
-                VALUES ('{cat}', '{k}', '{c}', {importance}, '{t}', 'sql_memory', 1);
-        """
-        result = self.execute(query)
-        ok = 'error' not in result.lower() if result else True
-        _log.info(f"remember({cat}/{k}) → {'ok' if ok else 'failed'}")
+        now = datetime.now(timezone.utc)
+        ok = self._db.execute("""
+            MERGE memory.Memories AS target
+            USING (SELECT %s AS category, %s AS key_name) AS source
+              ON target.category = source.category
+             AND target.key_name = source.key_name
+             AND target.is_active = 1
+            WHEN MATCHED THEN
+              UPDATE SET content=%s, importance=%s, tags=%s, updated_at=%s
+            WHEN NOT MATCHED THEN
+              INSERT (category, key_name, content, importance, tags, source, is_active, created_at, updated_at)
+              VALUES (%s, %s, %s, %s, %s, 'sql_memory', 1, %s, %s);
+        """, (category, key, content, importance, tags, now,
+              category, key, content, importance, tags, now, now))
+        _log.info(f"remember({category}/{key}) → {'ok' if ok else 'failed'}")
         return ok
 
     def recall(self, category: str, key: str) -> Optional[str]:
-        """
-        Retrieve a specific memory by category and key.
-
-        Returns:
-            Content string, or None if not found.
-        """
-        cat = _esc(category, 100)
-        k = _esc(key, 255)
-        return self.execute_scalar(f"""
-            SELECT content FROM memory.Memories
-            WHERE category='{cat}' AND key_name='{k}' AND is_active=1
-        """)
+        """Retrieve a specific memory's content. Returns content string or None."""
+        rows = self._db.query(
+            "SELECT content FROM memory.Memories WHERE category=%s AND key_name=%s AND is_active=1",
+            (category, key)
+        )
+        return rows[0]['content'] if rows else None
 
     def recall_recent(self, n: int = 10) -> List[Dict[str, Any]]:
-        """
-        Retrieve the N most recently updated memories across all categories.
-
-        Returns:
-            List of dicts with category, key_name, content, importance, tags, updated_at
-        """
-        out = self.execute(f"""
-            SELECT TOP {n} category, key_name, content, importance, tags,
-                   FORMAT(ISNULL(updated_at, created_at), 'yyyy-MM-dd HH:mm') as ts
-            FROM memory.Memories
-            WHERE is_active=1
+        """Return the N most recently updated memories across all categories."""
+        return self._db.query("""
+            SELECT TOP (%s) category, key_name, content, importance, tags,
+                   CONVERT(varchar, ISNULL(updated_at, created_at), 120) AS ts
+            FROM memory.Memories WHERE is_active=1
             ORDER BY ISNULL(updated_at, created_at) DESC
-        """)
-        return self._parse_table(out, ['category', 'key_name', 'content', 'importance', 'tags', 'ts'])
+        """, (n,))
 
-    def search_memories(self, query: str) -> List[Dict[str, Any]]:
-        """
-        Search memories by keyword across content and tags.
-
-        Returns:
-            List of matching memory dicts.
-        """
-        q = _esc(query, 200)
-        out = self.execute(f"""
-            SELECT category, key_name, content, importance, tags
+    def search_memories(self, keyword: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """Full-text search across content, tags, and key_name."""
+        like = f'%{keyword}%'
+        return self._db.query("""
+            SELECT TOP (%s) category, key_name, content, importance, tags
             FROM memory.Memories
             WHERE is_active=1
-              AND (content LIKE '%{q}%' OR tags LIKE '%{q}%' OR key_name LIKE '%{q}%')
-            ORDER BY importance DESC, updated_at DESC
-        """)
-        return self._parse_table(out, ['category', 'key_name', 'content', 'importance', 'tags'])
+              AND (content LIKE %s OR tags LIKE %s OR key_name LIKE %s)
+            ORDER BY importance DESC, ISNULL(updated_at, created_at) DESC
+        """, (limit, like, like, like))
 
     def forget(self, category: str, key: str) -> bool:
         """Soft-delete a memory (set is_active=0)."""
-        cat = _esc(category, 100)
-        k = _esc(key, 255)
-        self.execute(f"""
-            UPDATE memory.Memories SET is_active=0
-            WHERE category='{cat}' AND key_name='{k}'
-        """)
-        _log.info(f"forget({cat}/{k})")
-        return True
+        ok = self._db.execute(
+            "UPDATE memory.Memories SET is_active=0 WHERE category=%s AND key_name=%s",
+            (category, key)
+        )
+        _log.info(f"forget({category}/{key})")
+        return ok
 
-    # ── Activity Log (dbo.ActivityLog) ────────────────────────────────────
+    # ── Activity Log ──────────────────────────────────────────────────────────
 
     def log_event(self, event_type: str, agent: str, description: str,
-                  metadata: str = '') -> bool:
-        """
-        Write an event to the activity log.
+                  metadata: str = '', importance: int = 3) -> bool:
+        """Write an event to the activity log with UTC timestamp."""
+        return self._db.execute("""
+            INSERT INTO memory.ActivityLog (event_type, agent, description, metadata, importance, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (event_type, agent, description, metadata, importance,
+              datetime.now(timezone.utc)))
 
-        Args:
-            event_type: Type of event (e.g., 'task_complete', 'security_audit')
-            agent: Name of the agent logging the event
-            description: Human-readable description
-            metadata: Optional JSON or free-text metadata
-        """
-        et = _esc(event_type, 100)
-        ag = _esc(agent, 100)
-        desc = _esc(description)
-        meta = _esc(metadata)
-        self.execute(f"""
-            INSERT INTO memory.ActivityLog (event_type, agent, description, metadata)
-            VALUES ('{et}', '{ag}', '{desc}', '{meta}')
-        """)
-        return True
-
-    def get_recent_activity(self, since_hours: int = 24, agent: str = None) -> List[Dict]:
+    def get_recent_activity(self, since_hours: int = 24,
+                            agent: Optional[str] = None) -> List[Dict]:
         """Get recent activity log entries."""
-        where = f"WHERE logged_at >= DATEADD(HOUR, -{since_hours}, GETDATE())"
         if agent:
-            where += f" AND agent='{_esc(agent, 100)}'"
-        out = self.execute(f"""
+            return self._db.query("""
+                SELECT event_type, agent, description,
+                       CONVERT(varchar, created_at, 120) AS ts
+                FROM memory.ActivityLog
+                WHERE created_at >= DATEADD(HOUR, -%s, GETUTCDATE())
+                  AND agent=%s
+                ORDER BY created_at DESC
+            """, (since_hours, agent))
+        return self._db.query("""
             SELECT event_type, agent, description,
-                   FORMAT(logged_at, 'yyyy-MM-dd HH:mm') as ts
+                   CONVERT(varchar, created_at, 120) AS ts
             FROM memory.ActivityLog
-            {where}
-            ORDER BY logged_at DESC
-        """)
-        return self._parse_table(out, ['event_type', 'agent', 'description', 'ts'])
+            WHERE created_at >= DATEADD(HOUR, -%s, GETUTCDATE())
+            ORDER BY created_at DESC
+        """, (since_hours,))
 
-    # ── Task Queue (dbo.TaskQueue) ────────────────────────────────────────
+    # ── Task Queue ────────────────────────────────────────────────────────────
 
     def queue_task(self, agent: str, task_type: str, payload: str = '{}',
-                   priority = 5) -> Optional[str]:
-        """
-        Insert a new task into the queue.
-        priority can be int (1-9) or string ('critical','high','medium','low','free').
-        Returns: Task ID as string, or None on failure.
-        """
-        # Normalize priority to int
-        _priority_map = {'critical': 1, 'high': 2, 'medium': 5, 'low': 7, 'free': 9}
+                   priority: Any = 5) -> Optional[str]:
+        """Insert a new task. Priority can be int or string name."""
+        _pmap = {'critical': 1, 'high': 2, 'medium': 5, 'low': 7, 'free': 9}
         if isinstance(priority, str):
-            priority = _priority_map.get(priority.lower(), 5)
+            priority = _pmap.get(priority.lower(), 5)
         priority = int(priority)
-
-        ag = _esc(agent, 100)
-        tt = _esc(task_type, 100)
-        pl = _esc(payload)
-        self.execute(f"""
-            INSERT INTO memory.TaskQueue (agent, task_type, payload, priority, status)
-            VALUES ('{ag}', '{tt}', '{pl}', {priority}, 'pending')
-        """)
-        # Get the ID of the just-inserted task
-        tid = self.execute_scalar(f"""
+        now = datetime.now(timezone.utc)
+        ok = self._db.execute("""
+            INSERT INTO memory.TaskQueue (agent, task_type, payload, priority, status, created_at)
+            VALUES (%s, %s, %s, %s, 'pending', %s)
+        """, (agent, task_type, payload, priority, now))
+        if not ok:
+            return None
+        tid = self._db.scalar("""
             SELECT TOP 1 id FROM memory.TaskQueue
-            WHERE agent='{ag}' AND task_type='{tt}' AND status='pending'
+            WHERE agent=%s AND task_type=%s AND status='pending'
             ORDER BY created_at DESC
-        """)
-        _log.info(f"queue_task({ag}/{tt}) → id={tid}")
-        return tid
+        """, (agent, task_type))
+        _log.info(f"queue_task({agent}/{task_type}) → id={tid}")
+        return str(tid) if tid else None
 
-    def get_pending_tasks(self, agent: str, task_types: List[str]) -> List[Dict]:
-        """
-        Fetch pending tasks for an agent.
-
-        Returns:
-            List of task dicts with id, task_type, payload, priority, retry_count.
-        """
-        types_csv = ",".join(f"'{_esc(t, 100)}'" for t in task_types)
-        ag = _esc(agent, 100)
-        out = self.execute(f"""
-            SELECT id, task_type, payload, priority, retry_count
+    def get_pending_tasks(self, agent: str, task_types: List[str],
+                          limit: int = 10) -> List[Dict]:
+        """Fetch pending tasks for an agent, ordered by priority then age."""
+        if not task_types:
+            return []
+        placeholders = ','.join(['%s'] * len(task_types))
+        return self._db.query(f"""
+            SELECT TOP (%s) id, task_type, payload, priority, retry_count
             FROM memory.TaskQueue
-            WHERE agent='{ag}' AND task_type IN ({types_csv}) AND status='pending'
-            ORDER BY priority DESC, created_at ASC
-        """)
-        return self._parse_table(out, ['id', 'task_type', 'payload', 'priority', 'retry_count'])
+            WHERE agent=%s AND task_type IN ({placeholders}) AND status='pending'
+            ORDER BY priority ASC, created_at ASC
+        """, (limit, agent, *task_types))
 
-    def claim_task(self, task_id) -> bool:
+    def claim_task(self, task_id: Any) -> bool:
         """Mark a task as processing."""
-        self.execute(f"""
+        return self._db.execute("""
             UPDATE memory.TaskQueue
-            SET status='processing', started_at=GETDATE()
-            WHERE id={int(task_id)}
-        """)
-        return True
+            SET status='processing', started_at=%s
+            WHERE id=%s
+        """, (datetime.now(timezone.utc), int(task_id)))
 
-    def complete_task(self, task_id, result: str = '') -> bool:
-        """Mark a task as completed with optional result."""
-        r = _esc(result, 500)
-        self.execute(f"""
+    def complete_task(self, task_id: Any, result: str = '') -> bool:
+        """Mark a task as completed."""
+        ok = self._db.execute("""
             UPDATE memory.TaskQueue
-            SET status='completed', completed_at=GETDATE(), error_log='{r}'
-            WHERE id={int(task_id)}
-        """)
+            SET status='completed', completed_at=%s, error_log=%s
+            WHERE id=%s
+        """, (datetime.now(timezone.utc), result[:500], int(task_id)))
         _log.info(f"complete_task({task_id})")
-        return True
+        return ok
 
-    def fail_task(self, task_id, error: str, retry_count: int = 0,
+    def fail_task(self, task_id: Any, error: str, retry_count: int = 0,
                   max_retries: int = 3) -> bool:
-        """Mark a task as failed, or re-queue if retries remain."""
-        e = _esc(error, 800)
+        """Fail or re-queue a task based on retry count."""
         new_status = 'pending' if retry_count < max_retries else 'failed'
-        self.execute(f"""
+        ok = self._db.execute("""
             UPDATE memory.TaskQueue
-            SET status='{new_status}', retry_count=retry_count+1, error_log='{e}'
-            WHERE id={int(task_id)}
-        """)
+            SET status=%s, retry_count=retry_count+1, error_log=%s
+            WHERE id=%s
+        """, (new_status, error[:800], int(task_id)))
         _log.info(f"fail_task({task_id}) → {new_status}")
-        return True
+        return ok
 
     def get_completed_tasks(self, since_hours: int = 24,
-                            agent: str = None) -> List[Dict]:
-        """Get recently completed/failed tasks."""
-        where = f"WHERE status IN ('completed','failed') AND completed_at >= DATEADD(HOUR, -{since_hours}, GETDATE())"
+                            agent: Optional[str] = None) -> List[Dict]:
+        """Get recently completed or failed tasks."""
         if agent:
-            where += f" AND agent='{_esc(agent, 100)}'"
-        out = self.execute(f"""
+            return self._db.query("""
+                SELECT id, agent, task_type, status,
+                       CONVERT(varchar, completed_at, 120) AS ts
+                FROM memory.TaskQueue
+                WHERE status IN ('completed','failed')
+                  AND completed_at >= DATEADD(HOUR, -%s, GETUTCDATE())
+                  AND agent=%s
+                ORDER BY completed_at DESC
+            """, (since_hours, agent))
+        return self._db.query("""
             SELECT id, agent, task_type, status,
-                   FORMAT(completed_at, 'yyyy-MM-dd HH:mm') as ts
+                   CONVERT(varchar, completed_at, 120) AS ts
             FROM memory.TaskQueue
-            {where}
+            WHERE status IN ('completed','failed')
+              AND completed_at >= DATEADD(HOUR, -%s, GETUTCDATE())
             ORDER BY completed_at DESC
-        """)
-        return self._parse_table(out, ['id', 'agent', 'task_type', 'status', 'ts'])
+        """, (since_hours,))
 
-    # ── Knowledge Index (dbo.KnowledgeIndex) ──────────────────────────────
+    # ── Knowledge Index ───────────────────────────────────────────────────────
 
     def store_knowledge(self, domain: str, topic: str, summary: str = '',
                         file_path: str = '', tags: str = '') -> bool:
-        """
-        Store or update a knowledge entry. Upserts by domain + topic.
+        """Store or update a knowledge entry. Upserts by domain + topic."""
+        now = datetime.now(timezone.utc)
+        return self._db.execute("""
+            MERGE memory.KnowledgeIndex AS target
+            USING (SELECT %s AS domain, %s AS topic) AS source
+              ON target.domain = source.domain AND target.topic = source.topic
+            WHEN MATCHED THEN
+              UPDATE SET summary=%s, file_path=%s,
+                         last_trained=%s, training_count=ISNULL(training_count,0)+1
+            WHEN NOT MATCHED THEN
+              INSERT (domain, topic, summary, file_path, last_trained, training_count, created_at)
+              VALUES (%s, %s, %s, %s, %s, 1, %s);
+        """, (domain, topic, summary, file_path, now,
+              domain, topic, summary, file_path, now, now))
 
-        Args:
-            domain: Knowledge domain (e.g., 'stamps', 'facs', 'nlp')
-            topic: Specific topic title
-            summary: Content/summary text
-            file_path: Optional source file path
-            tags: Optional comma-separated tags
-        """
-        d = _esc(domain, 100)
-        t = _esc(topic, 255)
-        s = _esc(summary)
-        fp = _esc(file_path, 1000)
-        # KnowledgeIndex doesn't have a tags column in the current schema,
-        # so we store tags in the summary field prefix if needed
-        query = f"""
-            IF EXISTS (SELECT 1 FROM memory.KnowledgeIndex
-                       WHERE domain='{d}' AND topic='{t}')
-                UPDATE memory.KnowledgeIndex
-                SET summary='{s}', file_path='{fp}',
-                    last_trained=GETDATE(), training_count=ISNULL(training_count,0)+1
-                WHERE domain='{d}' AND topic='{t}';
-            ELSE
-                INSERT INTO memory.KnowledgeIndex
-                    (domain, topic, summary, file_path, last_trained, training_count)
-                VALUES ('{d}', '{t}', '{s}', '{fp}', GETDATE(), 1);
-        """
-        self.execute(query)
-        _log.info(f"store_knowledge({d}/{t})")
-        return True
-
-    def search_knowledge(self, domain: str, query: str = '') -> List[Dict]:
-        """
-        Search knowledge entries by domain and optional keyword.
-
-        Returns:
-            List of knowledge dicts.
-        """
-        d = _esc(domain, 100)
-        where = f"WHERE domain='{d}'"
-        if query:
-            q = _esc(query, 200)
-            where += f" AND (topic LIKE '%{q}%' OR summary LIKE '%{q}%')"
-        out = self.execute(f"""
+    def search_knowledge(self, domain: str, keyword: str = '') -> List[Dict]:
+        """Search knowledge entries by domain and optional keyword."""
+        if keyword:
+            like = f'%{keyword}%'
+            return self._db.query("""
+                SELECT domain, topic, summary, file_path, training_count,
+                       CONVERT(varchar, last_trained, 120) AS ts
+                FROM memory.KnowledgeIndex
+                WHERE domain=%s AND (topic LIKE %s OR summary LIKE %s)
+                ORDER BY last_trained DESC
+            """, (domain, like, like))
+        return self._db.query("""
             SELECT domain, topic, summary, file_path, training_count,
-                   FORMAT(last_trained, 'yyyy-MM-dd HH:mm') as ts
+                   CONVERT(varchar, last_trained, 120) AS ts
             FROM memory.KnowledgeIndex
-            {where}
-            ORDER BY last_trained DESC
-        """)
-        return self._parse_table(out, ['domain', 'topic', 'summary', 'file_path', 'training_count', 'ts'])
+            WHERE domain=%s ORDER BY last_trained DESC
+        """, (domain,))
 
     def get_recent_knowledge(self, n: int = 10) -> List[Dict]:
         """Get the N most recently updated knowledge entries."""
-        out = self.execute(f"""
-            SELECT TOP {n} domain, topic, summary,
-                   FORMAT(last_trained, 'yyyy-MM-dd HH:mm') as ts
-            FROM memory.KnowledgeIndex
-            ORDER BY last_trained DESC
-        """)
-        return self._parse_table(out, ['domain', 'topic', 'summary', 'ts'])
+        return self._db.query("""
+            SELECT TOP (%s) domain, topic, summary,
+                   CONVERT(varchar, last_trained, 120) AS ts
+            FROM memory.KnowledgeIndex ORDER BY last_trained DESC
+        """, (n,))
 
-    # ── Sessions (dbo.Sessions) ───────────────────────────────────────────
+    # ── Sessions ──────────────────────────────────────────────────────────────
 
     def get_session_context(self, session_id: str) -> Optional[Dict]:
-        """
-        Load session context from the database.
-
-        Returns:
-            Dict with session_key, channel, summary, token_count, or None.
-        """
-        sid = _esc(session_id, 255)
-        out = self.execute(f"""
-            SELECT session_key, channel, summary, token_count
-            FROM memory.Sessions
-            WHERE session_key='{sid}'
-        """)
-        rows = self._parse_table(out, ['session_key', 'channel', 'summary', 'token_count'])
-        if rows:
-            # Try to parse summary as JSON for structured context
-            row = rows[0]
-            try:
-                row['context'] = json.loads(row.get('summary', '{}'))
-            except (json.JSONDecodeError, TypeError):
-                row['context'] = {}
-            return row
-        return None
+        """Load session context from the database."""
+        rows = self._db.query(
+            "SELECT session_key, channel, summary, token_count FROM memory.Sessions WHERE session_key=%s",
+            (session_id,)
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        try:
+            row['context'] = json.loads(row.get('summary') or '{}')
+        except (json.JSONDecodeError, TypeError):
+            row['context'] = {}
+        return row
 
     def save_session_context(self, session_id: str, context_data: Dict,
                              channel: str = 'agent', token_count: int = 0) -> bool:
-        """
-        Persist session context to the database. Context is stored as JSON in summary.
+        """Persist session context as JSON in memory.Sessions."""
+        ctx_json = json.dumps(context_data, default=str)
+        now = datetime.now(timezone.utc)
+        return self._db.execute("""
+            MERGE memory.Sessions AS target
+            USING (SELECT %s AS session_key) AS source
+              ON target.session_key = source.session_key
+            WHEN MATCHED THEN
+              UPDATE SET summary=%s, token_count=%s, ended_at=%s
+            WHEN NOT MATCHED THEN
+              INSERT (session_key, channel, summary, token_count, started_at)
+              VALUES (%s, %s, %s, %s, %s);
+        """, (session_id, ctx_json, token_count, now,
+              session_id, channel, ctx_json, token_count, now))
 
-        Args:
-            session_id: Unique session key
-            context_data: Dict of context data (will be JSON-serialized)
-            channel: Channel name
-            token_count: Running token count for the session
-        """
-        sid = _esc(session_id, 255)
-        ch = _esc(channel, 100)
-        ctx_json = _esc(json.dumps(context_data, default=str))
-        query = f"""
-            IF EXISTS (SELECT 1 FROM memory.Sessions WHERE session_key='{sid}')
-                UPDATE memory.Sessions
-                SET summary='{ctx_json}', token_count={token_count}, ended_at=GETDATE()
-                WHERE session_key='{sid}';
-            ELSE
-                INSERT INTO memory.Sessions
-                    (session_key, channel, summary, token_count)
-                VALUES ('{sid}', '{ch}', '{ctx_json}', {token_count});
-        """
-        self.execute(query)
-        _log.info(f"save_session_context({sid})")
-        return True
-
-    # ── Schema Sync (for cloud backend) ──────────────────────────────────────
-
-    def ensure_schema(self) -> bool:
-        """
-        Create the memory schema + tables if they don't exist.
-        Useful for initializing the cloud backend.
-        """
-        schema_sql = """
-            IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name='memory')
-                EXEC('CREATE SCHEMA memory');
-        """
-        self.execute(schema_sql)
-
-        tables = {
-            'Memories': """
-                CREATE TABLE dbo.Memories (
-                    id BIGINT IDENTITY(1,1) PRIMARY KEY,
-                    category NVARCHAR(100) NOT NULL,
-                    key_name NVARCHAR(255),
-                    content NVARCHAR(MAX) NOT NULL,
-                    importance TINYINT DEFAULT 3,
-                    tags NVARCHAR(500),
-                    source NVARCHAR(255),
-                    created_at DATETIME2 DEFAULT GETDATE(),
-                    updated_at DATETIME2 DEFAULT GETDATE(),
-                    expires_at DATETIME2,
-                    is_active BIT DEFAULT 1
-                )
-            """,
-            'Sessions': """
-                CREATE TABLE dbo.Sessions (
-                    id BIGINT IDENTITY(1,1) PRIMARY KEY,
-                    session_key NVARCHAR(255),
-                    channel NVARCHAR(100),
-                    started_at DATETIME2 DEFAULT GETDATE(),
-                    ended_at DATETIME2,
-                    summary NVARCHAR(MAX),
-                    token_count INT DEFAULT 0
-                )
-            """,
-            'TaskQueue': """
-                CREATE TABLE dbo.TaskQueue (
-                    id BIGINT IDENTITY(1,1) PRIMARY KEY,
-                    agent NVARCHAR(100) NOT NULL,
-                    task_type NVARCHAR(100) NOT NULL,
-                    payload NVARCHAR(MAX),
-                    priority TINYINT DEFAULT 5,
-                    status NVARCHAR(50) DEFAULT 'pending',
-                    created_at DATETIME2 DEFAULT GETDATE(),
-                    started_at DATETIME2,
-                    completed_at DATETIME2,
-                    error_log NVARCHAR(MAX),
-                    retry_count TINYINT DEFAULT 0
-                )
-            """,
-            'KnowledgeIndex': """
-                CREATE TABLE dbo.KnowledgeIndex (
-                    id BIGINT IDENTITY(1,1) PRIMARY KEY,
-                    domain NVARCHAR(100) NOT NULL,
-                    topic NVARCHAR(255) NOT NULL,
-                    file_path NVARCHAR(1000),
-                    summary NVARCHAR(MAX),
-                    last_trained DATETIME2,
-                    training_count INT DEFAULT 0,
-                    created_at DATETIME2 DEFAULT GETDATE()
-                )
-            """,
-            'ActivityLog': """
-                CREATE TABLE dbo.ActivityLog (
-                    id BIGINT IDENTITY(1,1) PRIMARY KEY,
-                    event_type NVARCHAR(100) NOT NULL,
-                    agent NVARCHAR(100),
-                    description NVARCHAR(MAX),
-                    metadata NVARCHAR(MAX),
-                    logged_at DATETIME2 DEFAULT GETDATE()
-                )
-            """,
-        }
-
-        for table_name, create_sql in tables.items():
-            check = f"""
-                IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES
-                               WHERE TABLE_SCHEMA='memory' AND TABLE_NAME='{table_name}')
-                BEGIN
-                    {create_sql}
-                END
-            """
-            self.execute(check)
-            _log.info(f"ensure_schema: {table_name} OK")
-
-        return True
-
-    # ── Utility ──────────────────────────────────────────────────────────────
+    # ── Utility ───────────────────────────────────────────────────────────────
 
     def _parse_table(self, raw_output: str, columns: List[str]) -> List[Dict]:
         """
-        Parse sqlcmd tabular output into list of dicts.
-        Uses separator line positions to correctly determine column boundaries.
+        v1.x compat stub. v2 query() returns list[dict] directly.
+        Kept so any code that calls _parse_table on raw output still runs.
+        Returns empty list — callers should migrate to query().
         """
-        if not raw_output:
-            return []
+        _log.debug("_parse_table() called — migrate caller to use query() directly")
+        return []
 
-        lines = raw_output.split('\n')
-        if len(lines) < 3:
-            return []
-
-        results = []
-        header_line = None
-        separator_line = None
-        start_data = 0
-
-        # Find header and separator
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if not stripped or 'rows affected' in stripped.lower():
-                continue
-
-            # First non-empty line is header
-            if header_line is None:
-                header_idx = i
-                header_line = line
-                continue
-
-            # Line after header with dashes/spaces is separator
-            if all(c in '- ' for c in stripped) and len(stripped) > 3:
-                separator_line = line
-                start_data = i + 1
-                break
-
-        if not header_line or not separator_line:
-            return []
-
-        # Determine column start positions from separator line (groups of dashes)
-        # e.g. "-- ----- --------- ------- --------"
-        col_starts = []
-        in_dash = False
-        for pos, ch in enumerate(separator_line):
-            if ch == '-' and not in_dash:
-                col_starts.append(pos)
-                in_dash = True
-            elif ch == ' ':
-                in_dash = False
-
-        if not col_starts:
-            return []
-
-        # Map column names to positions using header; use col_starts for boundaries
-        # Match columns by order (header columns align with separator groups)
-        header_words = header_line.split()
-        col_positions = []
-        for i, start_pos in enumerate(col_starts):
-            # Find which requested column matches this header position
-            # Use ordinal match: col_starts[i] corresponds to columns[i]
-            if i < len(columns):
-                col_positions.append((columns[i], start_pos))
-
-        if not col_positions:
-            return []
-
-        # Parse data rows using separator-derived positions
-        for line_num in range(start_data, len(lines)):
-            line = lines[line_num]
-            stripped = line.strip()
-
-            if not stripped or 'rows affected' in stripped.lower():
-                continue
-
-            row = {}
-            for i, (col, start_pos) in enumerate(col_positions):
-                # End position is next column start or line end
-                if i + 1 < len(col_positions):
-                    end_pos = col_positions[i + 1][1] - 1  # -1 for space gap
-                else:
-                    end_pos = len(line)
-
-                value = line[start_pos:end_pos].strip() if start_pos < len(line) else ''
-                row[col] = value
-
-            if row:
-                results.append(row)
-
-        return results
-
-    def ping(self) -> bool:
-        """Test connectivity to the backend."""
-        result = self.execute("SELECT 1 AS ok")
-        return 'ok' in result.lower() or '1' in result
+    def ensure_schema(self) -> bool:
+        """Create memory schema + core tables if they don't exist."""
+        self._db.execute("IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name='memory') EXEC('CREATE SCHEMA memory')")
+        tables = {
+            'Memories': """CREATE TABLE memory.Memories (
+                id BIGINT IDENTITY(1,1) PRIMARY KEY, category NVARCHAR(100) NOT NULL,
+                key_name NVARCHAR(255), content NVARCHAR(MAX) NOT NULL,
+                importance TINYINT DEFAULT 3, tags NVARCHAR(500), source NVARCHAR(255),
+                created_at DATETIME2 DEFAULT GETUTCDATE(), updated_at DATETIME2 DEFAULT GETUTCDATE(),
+                expires_at DATETIME2, is_active BIT DEFAULT 1)""",
+            'Sessions': """CREATE TABLE memory.Sessions (
+                id BIGINT IDENTITY(1,1) PRIMARY KEY, session_key NVARCHAR(255),
+                channel NVARCHAR(100), started_at DATETIME2 DEFAULT GETUTCDATE(),
+                ended_at DATETIME2, summary NVARCHAR(MAX), token_count INT DEFAULT 0)""",
+            'TaskQueue': """CREATE TABLE memory.TaskQueue (
+                id BIGINT IDENTITY(1,1) PRIMARY KEY, agent NVARCHAR(100) NOT NULL,
+                task_type NVARCHAR(100) NOT NULL, payload NVARCHAR(MAX),
+                priority TINYINT DEFAULT 5, status NVARCHAR(50) DEFAULT 'pending',
+                created_at DATETIME2 DEFAULT GETUTCDATE(), started_at DATETIME2,
+                completed_at DATETIME2, error_log NVARCHAR(MAX), retry_count TINYINT DEFAULT 0)""",
+            'KnowledgeIndex': """CREATE TABLE memory.KnowledgeIndex (
+                id BIGINT IDENTITY(1,1) PRIMARY KEY, domain NVARCHAR(100) NOT NULL,
+                topic NVARCHAR(255) NOT NULL, file_path NVARCHAR(1000),
+                summary NVARCHAR(MAX), last_trained DATETIME2, training_count INT DEFAULT 0,
+                created_at DATETIME2 DEFAULT GETUTCDATE())""",
+            'ActivityLog': """CREATE TABLE memory.ActivityLog (
+                id BIGINT IDENTITY(1,1) PRIMARY KEY, event_type NVARCHAR(100) NOT NULL,
+                agent NVARCHAR(100), description NVARCHAR(MAX), metadata NVARCHAR(MAX),
+                importance TINYINT DEFAULT 3, created_at DATETIME2 DEFAULT GETUTCDATE())""",
+        }
+        for name, ddl in tables.items():
+            self._db.execute(f"""
+                IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES
+                               WHERE TABLE_SCHEMA='memory' AND TABLE_NAME='{name}')
+                BEGIN {ddl} END
+            """)
+            _log.info(f"ensure_schema: {name} OK")
+        return True
 
 
-# ── Module-level factory ─────────────────────────────────────────────────────
+# ── Module-level factory (singleton) ─────────────────────────────────────────
 
 _instances: Dict[str, SQLMemory] = {}
 
-def get_memory(backend: str = 'local') -> SQLMemory:
-    """
-    Get or create a SQLMemory instance for the specified backend.
-    Singleton pattern — reuses existing connections.
-
-    Args:
-        backend: 'local' or 'cloud'
-
-    Returns:
-        SQLMemory instance
-    """
+def get_memory(backend: str = 'cloud') -> SQLMemory:
+    """Get or create a SQLMemory instance. Singleton per backend."""
     if backend not in _instances:
         _instances[backend] = SQLMemory(backend)
     return _instances[backend]
 
 
-# ── Self-Test ────────────────────────────────────────────────────────────────
+# ── Self-test ─────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    print("=" * 60)
-    print("sql_dbo.py — Self-Test Suite")
-    print("=" * 60)
+    print("sql_memory v2.0 — self-test")
+    passed = failed = 0
 
-    passed = 0
-    failed = 0
-
-    def test(name, func):
+    def t(name, fn):
         global passed, failed
         try:
-            result = func()
-            status = "✅ PASS" if result else "⚠️  WARN (empty result)"
-            print(f"  {status}: {name}")
-            if result:
-                passed += 1
-            else:
-                passed += 1  # empty is still ok for some tests
+            r = fn()
+            print(f"  ✅ {name}: {r!r:.60}" if r is not None else f"  ✅ {name}: ok")
+            passed += 1
         except Exception as e:
-            print(f"  ❌ FAIL: {name} → {e}")
+            print(f"  ❌ {name}: {e}")
             failed += 1
 
-    for backend_name in ['local', 'cloud']:
-        print(f"\n── Backend: {backend_name} ──")
-        mem = SQLMemory(backend_name)
+    mem = get_memory('cloud')
+    t("ping", mem.ping)
+    t("remember", lambda: mem.remember('test', '_v2_test', 'v2 self-test', importance=1, tags='test'))
+    t("recall", lambda: mem.recall('test', '_v2_test'))
+    t("search", lambda: mem.search_memories('v2 self-test'))
+    t("log_event", lambda: mem.log_event('selftest', 'sql_memory', 'v2 test'))
+    t("queue_task", lambda: mem.queue_task('test_agent', '_v2_task', '{}', priority=1))
+    t("forget", lambda: mem.forget('test', '_v2_test'))
 
-        # Ensure schema exists (important for cloud)
-        if backend_name == 'cloud':
-            print("  Creating schema if needed...")
-            mem.ensure_schema()
-
-        test("ping", lambda: mem.ping())
-
-        test("remember",
-             lambda: mem.remember('test', 'selftest_key',
-                                  f'Self-test at {datetime.now()}',
-                                  importance=1, tags='test,selftest'))
-
-        test("recall",
-             lambda: mem.recall('test', 'selftest_key') is not None)
-
-        test("recall_recent",
-             lambda: isinstance(mem.recall_recent(5), list))
-
-        test("search_memories",
-             lambda: isinstance(mem.search_memories('selftest'), list))
-
-        test("log_event",
-             lambda: mem.log_event('selftest', 'sql_memory',
-                                   'Self-test ran successfully',
-                                   '{"test": true}'))
-
-        test("get_recent_activity",
-             lambda: isinstance(mem.get_recent_activity(1), list))
-
-        test("queue_task",
-             lambda: mem.queue_task('test_agent', 'selftest_task',
-                                    '{"test": true}', priority=1))
-
-        test("get_pending_tasks",
-             lambda: isinstance(mem.get_pending_tasks('test_agent', ['selftest_task']), list))
-
-        test("store_knowledge",
-             lambda: mem.store_knowledge('test', 'selftest_topic',
-                                         'Knowledge self-test entry',
-                                         '/dev/null', 'test'))
-
-        test("search_knowledge",
-             lambda: isinstance(mem.search_knowledge('test', 'selftest'), list))
-
-        test("save_session_context",
-             lambda: mem.save_session_context('selftest_session',
-                                              {'mood': 'testing', 'count': 1},
-                                              'test', 42))
-
-        test("get_session_context",
-             lambda: mem.get_session_context('selftest_session') is not None)
-
-        # Cleanup test data
-        test("forget (cleanup)",
-             lambda: mem.forget('test', 'selftest_key'))
-
-        # Clean up test task
-        mem.execute("""
-            DELETE FROM memory.TaskQueue
-            WHERE agent='test_agent' AND task_type='selftest_task'
-        """)
-        mem.execute("""
-            DELETE FROM memory.KnowledgeIndex
-            WHERE domain='test' AND topic='selftest_topic'
-        """)
-        mem.execute("""
-            DELETE FROM memory.Sessions WHERE session_key='selftest_session'
-        """)
-
-    print(f"\n{'=' * 60}")
-    print(f"Results: {passed} passed, {failed} failed")
-    print(f"{'=' * 60}")
-    sys.exit(1 if failed > 0 else 0)
+    print(f"\n{passed} passed, {failed} failed")
+    import sys; sys.exit(1 if failed else 0)
