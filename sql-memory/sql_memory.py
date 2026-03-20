@@ -205,31 +205,31 @@ class SQLMemory:
 
     def log_event(self, event_type: str, agent: str, description: str,
                   metadata: str = '', importance: int = 3) -> bool:
-        """Write an event to the activity log with UTC timestamp."""
+        """Write an event to the activity log (logged_at set by DB default)."""
         return self._db.execute("""
-            INSERT INTO memory.ActivityLog (event_type, agent, description, metadata, importance, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """, (event_type, agent, description, metadata, importance,
-              datetime.now(timezone.utc)))
+            INSERT INTO memory.ActivityLog (event_type, agent, description, metadata, importance)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (event_type, agent, description, metadata, importance))
 
     def get_recent_activity(self, since_hours: int = 24,
                             agent: Optional[str] = None) -> List[Dict]:
         """Get recent activity log entries."""
+        col = 'logged_at'   # actual column name on cloud schema
         if agent:
-            return self._db.query("""
+            return self._db.query(f"""
                 SELECT event_type, agent, description,
-                       CONVERT(varchar, created_at, 120) AS ts
+                       CONVERT(varchar, {col}, 120) AS ts
                 FROM memory.ActivityLog
-                WHERE created_at >= DATEADD(HOUR, -%s, GETUTCDATE())
+                WHERE {col} >= DATEADD(HOUR, -%s, GETUTCDATE())
                   AND agent=%s
-                ORDER BY created_at DESC
+                ORDER BY {col} DESC
             """, (since_hours, agent))
-        return self._db.query("""
+        return self._db.query(f"""
             SELECT event_type, agent, description,
-                   CONVERT(varchar, created_at, 120) AS ts
+                   CONVERT(varchar, {col}, 120) AS ts
             FROM memory.ActivityLog
-            WHERE created_at >= DATEADD(HOUR, -%s, GETUTCDATE())
-            ORDER BY created_at DESC
+            WHERE {col} >= DATEADD(HOUR, -%s, GETUTCDATE())
+            ORDER BY {col} DESC
         """, (since_hours,))
 
     # ── Task Queue ────────────────────────────────────────────────────────────
