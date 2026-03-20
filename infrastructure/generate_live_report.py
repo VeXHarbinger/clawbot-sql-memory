@@ -76,7 +76,7 @@ try:
     # Build report content
     lines = [
         '# Oblio Daily Report',
-        f'_Generated: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M")} EDT_',
+        f'_Generated: {datetime.datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")} UTC_',
         '_Report period: Last 24 hours_',
         '',
         '---',
