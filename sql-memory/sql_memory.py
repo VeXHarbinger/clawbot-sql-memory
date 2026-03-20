@@ -68,10 +68,11 @@ except ImportError:
 
 def _import_connector():
     """Find and import SQLConnector from wherever it's installed."""
-    # Try adjacent skill install first (workspace/skills/sql-connector/)
+    # Try adjacent skill install first (workspace/skills/sql-connector/scripts/)
+    skill_scripts_path = os.path.join(os.path.dirname(__file__), '..', '..', 'sql-connector', 'scripts')
     skill_path = os.path.join(os.path.dirname(__file__), '..', 'sql-connector')
     infra_path = os.path.join(os.path.dirname(__file__), '..', 'infrastructure')
-    for p in [skill_path, infra_path, os.path.dirname(__file__)]:
+    for p in [skill_scripts_path, skill_path, infra_path, os.path.dirname(__file__)]:
         abs_p = os.path.abspath(p)
         if os.path.exists(os.path.join(abs_p, 'sql_connector.py')):
             if abs_p not in sys.path:
@@ -398,6 +399,41 @@ class SQLMemory:
               VALUES (%s, %s, %s, %s, %s);
         """, (session_id, ctx_json, token_count, now,
               session_id, channel, ctx_json, token_count, now))
+
+    # ── Todos ─────────────────────────────────────────────────────────────────
+
+    def add_todo(self, title: str, project: str = '', priority: int = 5,
+                 tags: str = '', due_date=None) -> Optional[int]:
+        """Insert a new todo item. Returns the new todo id."""
+        now = datetime.now(timezone.utc)
+        return self._db.scalar("""
+            INSERT INTO memory.Todos (title, project, priority, status, tags, due_date, created_at)
+            OUTPUT INSERTED.id
+            VALUES (%s, %s, %s, 'open', %s, %s, %s)
+        """, (title, project, priority, tags, due_date, now))
+
+    def complete_todo(self, todo_id: int, status: str = 'done') -> bool:
+        """Mark a todo as done/completed."""
+        now = datetime.now(timezone.utc)
+        return self._db.execute("""
+            UPDATE memory.Todos SET status=%s, completed_at=%s WHERE id=%s
+        """, (status, now, todo_id))
+
+    def update_todo(self, todo_id: int, **fields) -> bool:
+        """Update arbitrary todo fields. Allowed: title, project, priority, status, tags, due_date."""
+        allowed = {'title', 'project', 'priority', 'status', 'tags', 'due_date'}
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return False
+        set_clause = ', '.join(f'{k}=%s' for k in updates)
+        params = list(updates.values()) + [todo_id]
+        return self._db.execute(
+            f'UPDATE memory.Todos SET {set_clause} WHERE id=%s', params
+        )
+
+    def delete_todo(self, todo_id: int) -> bool:
+        """Hard-delete a todo. Prefer complete_todo() for audit trail."""
+        return self._db.execute('DELETE FROM memory.Todos WHERE id=%s', (todo_id,))
 
     # ── Utility ───────────────────────────────────────────────────────────────
 
