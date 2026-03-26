@@ -1,6 +1,8 @@
 ---
 name: sql-memory
-description: "Semantic memory layer for OpenClaw agents. Use when: (1) persisting agent memories with importance scoring, (2) hierarchical memory rollups (daily→weekly→monthly→yearly), (3) queuing tasks for agents, (4) logging activity and audit trails, (5) managing knowledge bases with semantic search. Provides remember/recall/search/queue_task/log_event APIs. Built on sql-connector for reliable parameterized SQL execution."
+version: 2.0.0-alpha
+status: alpha
+description: "Semantic memory layer for OpenClaw agents. Use when: (1) persisting agent memories with importance scoring, (2) hierarchical memory rollups (daily→weekly→monthly→yearly), (3) queuing tasks for agents, (4) logging activity and audit trails, (5) managing knowledge bases with semantic search. Provides remember/recall/search/queue_task/log_event/add_todo APIs. Built on sql-connector. Requires SQL Server schema setup — see README. ALPHA: use at your own risk, API may change."
 ---
 
 # SQL Memory Skill
@@ -8,138 +10,140 @@ description: "Semantic memory layer for OpenClaw agents. Use when: (1) persistin
 
 ## Overview
 
-Provides agent-friendly memory operations: remember, recall, search, forget, plus task queue management, knowledge indexing, activity logging, and hierarchical memory rollups. All operations go through the SQL Connector skill for reliable, parameterized SQL execution.
-
-See `scripts/sql_memory.py` for full implementation.
+Persistent SQL Server-backed memory for OpenClaw agents. Wraps the sql-connector skill with agent-friendly operations: remember, recall, search, task queue, activity logging, todos, and hierarchical rollups (daily → weekly → monthly → yearly).
 
 ## Dependencies
 
-- **sql-connector** — provides the underlying database connection and query execution
+Install sql-connector first:
+
+```bash
+clawhub install sql-connector
+clawhub install sql-memory
+```
 
 ## Quick Start
 
 ```python
 from sql_memory import SQLMemory, get_memory
 
-mem = get_memory('cloud')
+mem = get_memory('cloud')   # or 'local'
 
-# Remember something
-mem.remember('facts', 'vex_timezone', 'VeX is in EST/EDT timezone', importance=7)
+# Store a memory
+mem.remember('facts', 'user_timezone', 'User is in EST/EDT', importance=7, tags='user,prefs')
 
 # Recall it
-entry = mem.recall('facts', 'vex_timezone')
+entry = mem.recall('facts', 'user_timezone')   # → 'User is in EST/EDT'
 
 # Search across all memories
 results = mem.search_memories('timezone')
 
-# Queue a task
-mem.queue_task('nlp_agent', 'analyze_document', '{"doc": "..."}', priority=3)
+# Queue a task for an agent
+task_id = mem.queue_task('my_agent', 'process_data', payload='{"source":"api"}', priority=3)
 
 # Log an event
-mem.log_event('training_complete', 'nlp_agent', 'Finished training cycle 42')
+mem.log_event(event_type='task_started', agent='my_agent', description='Processing began')
 
-# Store knowledge
-mem.store_knowledge('stamps', 'inverted_jenny', 'Rare 1918 misprint...', 'catalog')
+# Add a todo
+todo_id = mem.add_todo('Fix the login bug', priority=2, tags='bug,auth')
+mem.complete_todo(todo_id)
+
+# Connectivity check
+mem.ping()   # → True
 ```
-
-## Schema
-
-All tables live in the `memory` schema (SQL Server database):
-
-| Table | Purpose |
-|-------|---------|
-| `memory.Memories` | Long-term curated memories with importance scoring |
-| `memory.TaskQueue` | Task queue for agent work items |
-| `memory.ActivityLog` | Event/activity logging for audit trail |
-| `memory.KnowledgeIndex` | Domain-specific knowledge store |
-| `memory.Sessions` | Session tracking for agents |
-
-## Memory Rollups
-
-Hierarchical consolidation keeps memories fresh and relevant:
-
-```
-Daily memories → Weekly rollup (Sundays 3AM)
-Weekly rollups → Monthly rollup (1st of month)
-Monthly → Quarterly (Jan/Apr/Jul/Oct)
-Quarterly → Yearly (Jan 1st)
-```
-
-Each rollup:
-1. Summarizes source entries
-2. Creates a consolidated entry with back-references
-3. Reduces importance of source entries
-4. Tags sources as `rolled_up`
-
-### Importance Scale
-
-| Level | Meaning | Example |
-|-------|---------|---------|
-| 1-2 | Ephemeral, archive | Old workspace file |
-| 3-4 | Context, nice-to-know | Debug notes |
-| 5-6 | Standard operational | Task completion |
-| 7-8 | Important milestone | Architecture decision |
-| 9 | Critical | System design choice |
-| 10 | Permanent | Core identity/values |
 
 ## API Reference
 
-### Memory Operations
+### Memory
 
-| Method | Description | Example |
-|--------|-------------|---------|
-| `remember(cat, key, content, importance, tags)` | Store a memory | `mem.remember('facts', 'name', 'Oblio', 7)` |
-| `recall(cat, key)` | Retrieve a memory | `mem.recall('facts', 'name')` |
-| `search_memories(query, limit)` | Semantic search | `mem.search_memories('timezone', limit=5)` |
-| `forget(cat, key)` | Delete a memory | `mem.forget('facts', 'name')` |
+- `remember(category, key, content, importance=3, tags='')` — Store or update a memory
+- `recall(category, key)` — Retrieve most recent active entry → string or None
+- `search_memories(query, limit=20)` — Full-text search across content, tags, key_name
+- `recall_recent(n=10)` — Most recent N memories across all categories
+- `forget(category, key)` — Soft-delete (marks is_active=0)
 
 ### Task Queue
 
-| Method | Description |
-|--------|-------------|
-| `queue_task(agent, type, payload, priority)` | Add a task |
-| `claim_task(id)` | Mark task as processing |
-| `complete_task(id, result)` | Mark task as completed |
-| `fail_task(id, error, retries, max)` | Fail with retry logic |
+- `queue_task(agent, task_type, payload='{}', priority=5)` — Add a task → task_id
+- `get_pending_tasks(agent, task_types, limit=10)` — Fetch pending tasks
+- `claim_task(task_id)` — Mark as processing
+- `complete_task(task_id, result='')` — Mark as completed
+- `fail_task(task_id, error, retry_count, max_retries=3)` — Fail or re-queue
 
 ### Activity Logging
 
-| Method | Description |
-|--------|-------------|
-| `log_event(type, agent, detail, extra)` | Log an activity |
-| `get_recent_activity(hours, agent)` | Query recent events |
+- `log_event(event_type, agent='', description='', metadata='', importance=3)` — Write to ActivityLog
+- `get_recent_activity(since_hours=24, agent=None)` — Query recent events
 
-## Configuration
+### Todos
 
-Uses the same environment variables as sql-connector:
+- `add_todo(title, project='', priority=5, tags='', due_date=None)` — Create todo → id
+- `complete_todo(todo_id)` — Mark done
+- `update_todo(todo_id, **fields)` — Update: title, project, priority, status, tags, due_date
+- `delete_todo(todo_id)` — Hard delete
 
+### Knowledge Index
+
+- `store_knowledge(domain, topic, summary='', file_path='', tags='')` — Upsert knowledge entry
+- `search_knowledge(domain, keyword='')` — Search by domain + keyword
+- `get_recent_knowledge(n=10)` — Most recently updated entries
+
+## Importance Scale
+
+- **1–2** — Ephemeral, can archive (old workspace files, debug notes)
+- **3–4** — Context, nice-to-know (routine task completions)
+- **5–6** — Standard operational (significant events)
+- **7–8** — Important milestone (architecture decisions)
+- **9** — Critical (system design choices)
+- **10** — Permanent (core identity, values, golden rules)
+
+## Memory Rollup Schedule
+
+Hierarchical compression keeps long-term memory manageable:
+
+- Daily entries → rolled up weekly (every Sunday)
+- Weekly → monthly (1st of month)
+- Monthly → yearly (January 1st)
+
+Each rollup preserves source references for traceability.
+
+## .env Setup
+
+Same pattern as sql-connector:
+
+```env
+SQL_local_server=10.0.0.110
+SQL_local_database=YourDatabase
+SQL_local_user=your_user
+SQL_local_password=your_password
+
+SQL_cloud_server=yourserver.database.windows.net
+SQL_cloud_database=your_cloud_db
+SQL_cloud_user=your_cloud_user
+SQL_cloud_password=your_cloud_password
 ```
-SQL_CLOUD_SERVER=sql5112.site4now.net
-SQL_CLOUD_DATABASE=db_99ba1f_memory4oblio
-SQL_CLOUD_USER=...
-SQL_CLOUD_PASSWORD=...
 
-SQL_LOCAL_SERVER=10.0.0.110
-SQL_LOCAL_DATABASE=Oblio_Memories
-SQL_LOCAL_USER=sa
-SQL_LOCAL_PASSWORD=...
+## Schema Setup
+
+Run the included setup script, or paste the DDL from the README into SSMS/Azure Data Studio.
+
+```bash
+python3 setup_schema.py
 ```
 
 ## Architecture
 
 ```
-┌──────────────────┐
-│   Agents         │ ← OblioAgent subclasses
-├──────────────────┤
-│   SQLMemory      │ ← Semantic operations (remember/recall/queue/log)
-├──────────────────┤
-│   SQLConnector   │ ← Generic SQL execution (retry, parameterized, logging)
-├──────────────────┤
-│   pymssql (TDS)  │ ← Native SQL Server driver
-└──────────────────┘
+Agents
+  └── SQLMemory   ← remember/recall/queue/log/todo
+        └── SQLConnector  ← retry, parameterized SQL (pymssql)
+              └── SQL Server
 ```
+
+## Related
+
+- [clawbot-sql-connector](https://github.com/VeXHarbinger/clawbot-sql-connector) — transport layer
+- [oblio-heart-and-soul](https://github.com/VeXHarbinger/oblio-heart-and-soul) — full reference implementation
 
 ## License
 
 MIT
-
