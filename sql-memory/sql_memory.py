@@ -214,21 +214,22 @@ class SQLMemory:
     def get_recent_activity(self, since_hours: int = 24,
                             agent: Optional[str] = None) -> List[Dict]:
         """Get recent activity log entries."""
+        col = 'logged_at'   # actual column name on cloud schema
         if agent:
-            return self._db.query("""
+            return self._db.query(f"""
                 SELECT event_type, agent, description,
-                       CONVERT(varchar, logged_at, 120) AS ts
+                       CONVERT(varchar, {col}, 120) AS ts
                 FROM memory.ActivityLog
-                WHERE logged_at >= DATEADD(HOUR, -%s, GETUTCDATE())
+                WHERE {col} >= DATEADD(HOUR, -%s, GETUTCDATE())
                   AND agent=%s
-                ORDER BY logged_at DESC
+                ORDER BY {col} DESC
             """, (since_hours, agent))
-        return self._db.query("""
+        return self._db.query(f"""
             SELECT event_type, agent, description,
-                   CONVERT(varchar, logged_at, 120) AS ts
+                   CONVERT(varchar, {col}, 120) AS ts
             FROM memory.ActivityLog
-            WHERE logged_at >= DATEADD(HOUR, -%s, GETUTCDATE())
-            ORDER BY logged_at DESC
+            WHERE {col} >= DATEADD(HOUR, -%s, GETUTCDATE())
+            ORDER BY {col} DESC
         """, (since_hours,))
 
     # ── Task Queue ────────────────────────────────────────────────────────────
@@ -424,15 +425,11 @@ class SQLMemory:
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
             return False
-        # Build SET clause from allowlisted keys only — safe against injection
-        set_parts = []
-        params = []
-        for col in updates:
-            set_parts.append(f'{col}=%s')
-            params.append(updates[col])
-        params.append(todo_id)
-        sql = 'UPDATE memory.Todos SET ' + ', '.join(set_parts) + ' WHERE id=%s'
-        return self._db.execute(sql, params)
+        set_clause = ', '.join(f'{k}=%s' for k in updates)
+        params = list(updates.values()) + [todo_id]
+        return self._db.execute(
+            f'UPDATE memory.Todos SET {set_clause} WHERE id=%s', params
+        )
 
     def delete_todo(self, todo_id: int) -> bool:
         """Hard-delete a todo. Prefer complete_todo() for audit trail."""
@@ -477,7 +474,7 @@ class SQLMemory:
             'ActivityLog': """CREATE TABLE memory.ActivityLog (
                 id BIGINT IDENTITY(1,1) PRIMARY KEY, event_type NVARCHAR(100) NOT NULL,
                 agent NVARCHAR(100), description NVARCHAR(MAX), metadata NVARCHAR(MAX),
-                importance TINYINT DEFAULT 3, logged_at DATETIME2 DEFAULT GETUTCDATE())""",
+                importance TINYINT DEFAULT 3, created_at DATETIME2 DEFAULT GETUTCDATE())""",
         }
         for name, ddl in tables.items():
             self._db.execute(f"""
