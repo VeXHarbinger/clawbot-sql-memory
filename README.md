@@ -30,76 +30,73 @@ CREATE SCHEMA memory;
 GO
 
 CREATE TABLE memory.Memories (
-    id          BIGINT         IDENTITY(1,1) PRIMARY KEY,
+    id          UNIQUEIDENTIFIER PRIMARY KEY DEFAULT newid(),
     category    NVARCHAR(100)  NOT NULL,
-    key_name    NVARCHAR(255),
+    key         NVARCHAR(255)  NOT NULL,
     content     NVARCHAR(MAX)  NOT NULL,
-    importance  TINYINT        DEFAULT 3,
-    tags        NVARCHAR(500),
-    source      NVARCHAR(255),
-    is_active   BIT            DEFAULT 1,
+    importance  INT            DEFAULT 3,
+    tags        NVARCHAR(500)  DEFAULT '',
+    status      NVARCHAR(50)   DEFAULT 'active',
     created_at  DATETIME2      DEFAULT GETUTCDATE(),
-    updated_at  DATETIME2      DEFAULT GETUTCDATE(),
-    expires_at  DATETIME2      NULL
+    updated_at  DATETIME2      DEFAULT GETUTCDATE()
 );
 
 CREATE TABLE memory.TaskQueue (
-    id           BIGINT         IDENTITY(1,1) PRIMARY KEY,
-    agent        NVARCHAR(100)  NOT NULL,
-    task_type    NVARCHAR(100)  NOT NULL,
-    payload      NVARCHAR(MAX),
-    priority     TINYINT        DEFAULT 5,
-    status       NVARCHAR(50)   DEFAULT 'pending',
-    retry_count  TINYINT        DEFAULT 0,
-    model_hint   NVARCHAR(100)  DEFAULT '',
-    created_at   DATETIME2      DEFAULT GETUTCDATE(),
-    started_at   DATETIME2      NULL,
-    completed_at DATETIME2      NULL,
-    error_log    NVARCHAR(MAX)
+    id          UNIQUEIDENTIFIER PRIMARY KEY DEFAULT newid(),
+    agent       NVARCHAR(100)  NOT NULL,
+    task_type   NVARCHAR(100)  NOT NULL,
+    payload     NVARCHAR(MAX)  DEFAULT '',
+    priority    INT            DEFAULT 5,
+    status      NVARCHAR(50)   DEFAULT 'pending',
+    retries     INT            DEFAULT 0,
+    model_hint  NVARCHAR(100)  DEFAULT '',
+    created_at  DATETIME2      DEFAULT GETUTCDATE(),
+    updated_at  DATETIME2      DEFAULT GETUTCDATE(),
+    claimed_at  DATETIME2      NULL,
+    completed_at DATETIME2     NULL,
+    error       NVARCHAR(MAX)  DEFAULT ''
 );
 
 CREATE TABLE memory.ActivityLog (
-    id          BIGINT         IDENTITY(1,1) PRIMARY KEY,
+    id          UNIQUEIDENTIFIER PRIMARY KEY DEFAULT newid(),
     event_type  NVARCHAR(100)  NOT NULL,
-    agent       NVARCHAR(100),
-    description NVARCHAR(MAX),
-    metadata    NVARCHAR(MAX),
-    importance  TINYINT        DEFAULT 3,
-    logged_at   DATETIME2      DEFAULT GETUTCDATE()
+    agent       NVARCHAR(100)  DEFAULT '',
+    description NVARCHAR(MAX)  DEFAULT '',
+    metadata    NVARCHAR(MAX)  DEFAULT '',
+    importance  INT            DEFAULT 3,
+    created_at  DATETIME2      DEFAULT GETUTCDATE()
 );
 
 CREATE TABLE memory.Sessions (
-    id          BIGINT         IDENTITY(1,1) PRIMARY KEY,
-    session_key NVARCHAR(255),
-    channel     NVARCHAR(100),
-    summary     NVARCHAR(MAX),
-    token_count INT            DEFAULT 0,
+    id          UNIQUEIDENTIFIER PRIMARY KEY DEFAULT newid(),
+    session_key NVARCHAR(255)  NOT NULL,
+    agent       NVARCHAR(100)  DEFAULT '',
+    status      NVARCHAR(50)   DEFAULT 'active',
+    metadata    NVARCHAR(MAX)  DEFAULT '',
     started_at  DATETIME2      DEFAULT GETUTCDATE(),
     ended_at    DATETIME2      NULL
 );
 
 CREATE TABLE memory.KnowledgeIndex (
-    id              BIGINT         IDENTITY(1,1) PRIMARY KEY,
-    domain          NVARCHAR(100)  NOT NULL,
-    topic           NVARCHAR(255)  NOT NULL,
-    file_path       NVARCHAR(1000),
-    summary         NVARCHAR(MAX),
-    last_trained    DATETIME2,
-    training_count  INT            DEFAULT 0,
-    created_at      DATETIME2      DEFAULT GETUTCDATE()
+    id          UNIQUEIDENTIFIER PRIMARY KEY DEFAULT newid(),
+    domain      NVARCHAR(100)  NOT NULL,
+    key         NVARCHAR(255)  NOT NULL,
+    content     NVARCHAR(MAX)  NOT NULL,
+    source      NVARCHAR(255)  DEFAULT '',
+    tags        NVARCHAR(500)  DEFAULT '',
+    created_at  DATETIME2      DEFAULT GETUTCDATE()
 );
 
 CREATE TABLE memory.Todos (
-    id           BIGINT         IDENTITY(1,1) PRIMARY KEY,
-    title        NVARCHAR(500)  NOT NULL,
-    project      NVARCHAR(255)  DEFAULT '',
-    description  NVARCHAR(MAX)  DEFAULT '',
-    priority     INT            DEFAULT 5,
-    status       NVARCHAR(50)   DEFAULT 'open',
-    tags         NVARCHAR(500)  DEFAULT '',
-    due_date     DATETIME2      NULL,
-    created_at   DATETIME2      DEFAULT GETUTCDATE(),
-    completed_at DATETIME2      NULL
+    id          UNIQUEIDENTIFIER PRIMARY KEY DEFAULT newid(),
+    title       NVARCHAR(500)  NOT NULL,
+    description NVARCHAR(MAX)  DEFAULT '',
+    priority    INT            DEFAULT 3,
+    status      NVARCHAR(50)   DEFAULT 'open',
+    tags        NVARCHAR(500)  DEFAULT '',
+    created_at  DATETIME2      DEFAULT GETUTCDATE(),
+    updated_at  DATETIME2      DEFAULT GETUTCDATE(),
+    closed_at   DATETIME2      NULL
 );
 GO
 ```
