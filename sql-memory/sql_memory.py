@@ -6,12 +6,12 @@ Semantic memory layer for OpenClaw agents. All operations go through
 SQLConnector v2 (pymssql, parameterised, sealed API) — no subprocess/sqlcmd.
 
 Supports two backends:
-  - 'cloud'  → site4now hosted (SQL5112.site4now.net) — default
-  - 'local'  → SQL Server on DEAUS (10.0.0.110)
+  - 'local'  → SQL Server on DEAUS (10.0.0.110) — default
+  - 'cloud'  → site4now hosted (SQL5112.site4now.net)
 
 Backward-compatible with v1.x callers:
-  - SQLMemory('cloud')         — works as before
-  - get_memory('cloud')        — singleton factory preserved
+  - SQLMemory('local')         — works as before
+  - get_memory('local')        — singleton factory preserved
   - mem.remember / recall / search / queue_task / log_event — all preserved
   - mem.execute(raw_sql)       — preserved as legacy passthrough (returns bool)
   - mem.execute_scalar(sql)    — preserved, returns Any
@@ -25,7 +25,7 @@ New in v2.0:
 
 Usage:
     from sql_memory import SQLMemory, get_memory
-    mem = get_memory('cloud')
+    mem = get_memory('local')
     mem.remember('facts', 'sky_color', 'The sky is blue', importance=3)
     result = mem.recall('facts', 'sky_color')
 """
@@ -105,10 +105,10 @@ class SQLMemory:
     Wraps SQLConnector — all queries are parameterised, no string interpolation.
 
     Args:
-        backend: 'cloud' (default) or 'local'
+        backend: 'local' (default) or 'cloud'
     """
 
-    def __init__(self, backend: str = 'cloud') -> None:
+    def __init__(self, backend: str = 'local') -> None:
         self.backend = backend
         self._db = get_connector(backend)
         _log.info(f"SQLMemory v2.0 initialized (backend={backend})")
@@ -490,7 +490,7 @@ class SQLMemory:
 
 _instances: Dict[str, SQLMemory] = {}
 
-def get_memory(backend: str = 'cloud') -> SQLMemory:
+def get_memory(backend: str = 'local') -> SQLMemory:
     """Get or create a SQLMemory instance. Singleton per backend."""
     if backend not in _instances:
         _instances[backend] = SQLMemory(backend)
@@ -513,7 +513,7 @@ if __name__ == '__main__':
             print(f"  ❌ {name}: {e}")
             failed += 1
 
-    mem = get_memory('cloud')
+    mem = get_memory('local')
     t("ping", mem.ping)
     t("remember", lambda: mem.remember('test', '_v2_test', 'v2 self-test', importance=1, tags='test'))
     t("recall", lambda: mem.recall('test', '_v2_test'))
