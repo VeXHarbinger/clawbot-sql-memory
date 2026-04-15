@@ -41,16 +41,16 @@ class TestSQLMemoryConnection(unittest.TestCase):
     """Test connection and ping."""
 
     def test_get_memory_cloud(self):
-        mem = get_memory('cloud')
+        mem = get_memory('local')
         self.assertIsInstance(mem, SQLMemory)
 
     def test_ping(self):
-        mem = get_memory('cloud')
+        mem = get_memory('local')
         result = mem.ping()
         self.assertIsInstance(result, bool)
 
     def test_ping_succeeds_with_valid_creds(self):
-        mem = get_memory('cloud')
+        mem = get_memory('local')
         self.assertTrue(mem.ping(), "Ping should succeed with valid credentials")
 
 
@@ -58,7 +58,7 @@ class TestMemoryCRUD(unittest.TestCase):
     """Test remember/recall/search/forget cycle."""
 
     def setUp(self):
-        self.mem = get_memory('cloud')
+        self.mem = get_memory('local')
         self.test_key = f"test_{datetime.now().strftime('%Y%m%d%H%M%S')}"
 
     def test_remember_and_recall(self):
@@ -90,7 +90,7 @@ class TestTaskQueue(unittest.TestCase):
     """Test task queue operations."""
 
     def setUp(self):
-        self.mem = get_memory('cloud')
+        self.mem = get_memory('local')
         self.test_task_type = f"test_task_{datetime.now().strftime('%H%M%S')}"
 
     def test_queue_and_claim(self):
@@ -137,7 +137,7 @@ class TestActivityLog(unittest.TestCase):
     """Test event logging."""
 
     def setUp(self):
-        self.mem = get_memory('cloud')
+        self.mem = get_memory('local')
 
     def test_log_event(self):
         self.mem.log_event('test_event', 'test_agent', 'unit test log entry')
@@ -149,7 +149,7 @@ class TestKnowledge(unittest.TestCase):
     """Test knowledge store operations."""
 
     def setUp(self):
-        self.mem = get_memory('cloud')
+        self.mem = get_memory('local')
         self.test_topic = f"test_topic_{datetime.now().strftime('%H%M%S')}"
 
     def test_store_and_search_knowledge(self):
@@ -167,13 +167,13 @@ class TestEdgeCases(unittest.TestCase):
     """Test error handling and edge cases."""
 
     def test_execute_invalid_sql(self):
-        mem = get_memory('cloud')
+        mem = get_memory('local')
         result = mem.execute("SELECT * FROM nonexistent_table_xyz")
         # Should not crash, may return error text
         self.assertIsInstance(result, str)
 
     def test_remember_with_special_chars(self):
-        mem = get_memory('cloud')
+        mem = get_memory('local')
         key = f"special_test_{datetime.now().strftime('%H%M%S')}"
         mem.remember('test', key, "Content with 'quotes' and \"doubles\" and <html>", importance=1)
         result = mem.recall('test', key)
@@ -181,7 +181,7 @@ class TestEdgeCases(unittest.TestCase):
         mem.execute(f"DELETE FROM memory.Memories WHERE key_name='{key}'")
 
     def test_very_long_content(self):
-        mem = get_memory('cloud')
+        mem = get_memory('local')
         key = f"long_test_{datetime.now().strftime('%H%M%S')}"
         long_content = "x" * 5000
         mem.remember('test', key, long_content, importance=1)

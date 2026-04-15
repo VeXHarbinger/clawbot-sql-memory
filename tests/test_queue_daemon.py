@@ -62,7 +62,7 @@ class TestFetchParsing(unittest.TestCase):
     def test_fetch_returns_none_or_dict(self):
         from sql_memory import get_memory
         from queue_daemon import fetch_next_task
-        mem = get_memory('cloud')
+        mem = get_memory('local')
         result = fetch_next_task(mem)
         self.assertTrue(result is None or isinstance(result, dict))
 
